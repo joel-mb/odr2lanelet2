@@ -17,6 +17,7 @@ class Lanelet2Map(object):
         self._points = {}
         self._linestrings = {}
         self._lanelets = {}
+        self._regulatory_elements = {}
 
     def get_point(self, uid):
         return self._points.get(uid, None)
@@ -27,6 +28,9 @@ class Lanelet2Map(object):
     def get_lanelet(self, uid):
         return self._lanelets.get(uid, None)
 
+    def get_regulatory_element(self, uid):
+        return self._regulatory_elements.get(uid, None)
+
     def get_points(self):
         return self._points.values()
 
@@ -35,6 +39,9 @@ class Lanelet2Map(object):
 
     def get_lanelets(self):
         return self._lanelets.values()
+
+    def get_regulatory_elements(self):
+        return self._regulatory_elements.values()
 
     def add_point(self, point):
         self._points[point.uid] = point
@@ -48,6 +55,9 @@ class Lanelet2Map(object):
         self._lanelets[lanelet.uid] = lanelet
         return lanelet.uid
 
+    def add_regulatory_element(self, regulatory_element):
+        self._regulatory_elements[regulatory_element.uid] = regulatory_element
+        return regulatory_element.uid
 
 def save(lanelet2_map, filename):
     def _create_attributes_tags(attributes, parent):
@@ -95,7 +105,43 @@ def save(lanelet2_map, filename):
             'role': 'right'
         })
 
+        for regulatory_element in lanelet.regulatory_elements:
+            regulatory_element_tag = ET.SubElement(relation_tag, 'member', {
+                'type': 'relation',
+                'ref': str(regulatory_element),
+                'role': 'regulatory_element'
+            })
+
         _create_attributes_tags(lanelet.attributes, relation_tag)
+
+    # This should be create relation tag. All of them have the same structure
+    def _create_regulatory_element_tag(regulatory_element):
+        relation_tag = ET.SubElement(root, 'relation', {
+            'id': str(regulatory_element.uid),
+            'visible': 'true',
+            'version': '1'
+        })
+
+        refers_tag = ET.SubElement(relation_tag, 'member', {
+            'type': 'way',
+            'ref': str(regulatory_element.refers[0]),
+            'role': 'refers'
+        })
+        ref_line_tag = ET.SubElement(relation_tag, 'member', {
+            'type': 'way',
+            'ref': str(regulatory_element.ref_line),
+            'role': 'ref_line'
+        })
+
+        # Members
+        for member in regulatory_element.members:
+            ref_line_tag = ET.SubElement(relation_tag, 'member', {
+                'type': member.type_,
+                'ref': str(member.ref),
+                'role': member.role
+            })
+        
+        _create_attributes_tags(regulatory_element.attributes, relation_tag)
 
     root = ET.Element('osm', {"version": "0.6"})
     root.addprevious(
@@ -105,6 +151,7 @@ def save(lanelet2_map, filename):
     map(_create_node_tag, lanelet2_map.get_points())
     map(_create_way_tag, lanelet2_map.get_linestrings())
     map(_create_relation_tag, lanelet2_map.get_lanelets())
+    map(_create_regulatory_element_tag, lanelet2_map.get_regulatory_elements())
 
     tree = ET.ElementTree(root)
     tree.write(filename,

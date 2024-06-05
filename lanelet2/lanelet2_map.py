@@ -1,11 +1,3 @@
-#!/usr/bin/env python
-
-# Copyright (c) 2020 Computer Vision Center (CVC) at the Universitat Autonoma de
-# Barcelona (UAB).
-#
-# This work is licensed under the terms of the MIT license.
-# For a copy, see <https://opensource.org/licenses/MIT>.
-
 import datetime
 import os
 
@@ -27,6 +19,18 @@ class Lanelet2Map(object):
     def get_lanelet(self, uid):
         return self._lanelets.get(uid, None)
 
+    def get_lanelet_start_points(self, uid):
+        borders = self.get_lanelet(uid).borders
+        edges = (self.get_linestring(borders[0]).points,
+                 self.get_linestring(borders[1]).points)
+        return (edges[0][0], edges[1][0])
+
+    def get_lanelet_end_points(self, uid):
+        borders = self.get_lanelet(uid).borders
+        edges = (self.get_linestring(borders[0]).points,
+                 self.get_linestring(borders[1]).points)
+        return (edges[0][-1], edges[1][-1])
+
     def get_points(self):
         return self._points.values()
 
@@ -37,7 +41,8 @@ class Lanelet2Map(object):
         return self._lanelets.values()
 
     def add_point(self, point):
-        self._points[point.uid] = point
+        if not point.uid in self._points:
+            self._points[point.uid] = point
         return point.uid
 
     def add_linestring(self, linestring):
@@ -102,9 +107,9 @@ def save(lanelet2_map, filename):
         ET.Comment('generated on {date:%Y-%m-%d %H:%M:%S} by {script:}'.format(
             date=datetime.datetime.now(), script=os.path.basename(__file__))))
 
-    map(_create_node_tag, lanelet2_map.get_points())
-    map(_create_way_tag, lanelet2_map.get_linestrings())
-    map(_create_relation_tag, lanelet2_map.get_lanelets())
+    list(map(_create_node_tag, lanelet2_map.get_points()))
+    list(map(_create_way_tag, lanelet2_map.get_linestrings()))
+    list(map(_create_relation_tag, lanelet2_map.get_lanelets()))
 
     tree = ET.ElementTree(root)
     tree.write(filename,

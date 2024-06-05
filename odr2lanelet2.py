@@ -1,10 +1,3 @@
-#!/usr/bin/env python
-
-# Copyright (c) 2020 Computer Vision Center (CVC) at the Universitat Autonoma de
-# Barcelona (UAB).
-#
-# This work is licensed under the terms of the MIT license.
-# For a copy, see <https://opensource.org/licenses/MIT>.
 """OpenDRIVE to Lanelet2 conversor tool"""
 
 # ==================================================================================================
@@ -13,12 +6,11 @@
 
 import argparse
 import logging
+import math
 
 import lanelet2
 import opendrive
 from bridge import Bridge
-
-import carla
 
 # ==================================================================================================
 # -- conversor -------------------------------------------------------------------------------------
@@ -50,27 +42,22 @@ class Odr2Lanelet2Conversor(object):
         self._odr2lanelet = {}
 
         logging.debug("Processing standard roads")
-        map(self._convert_road_to_lanelets, self._odr_map.get_std_roads())
+        list(map(self._convert_road_to_lanelets, self._odr_map.get_std_roads()))
         logging.debug("Processing paths")
-        map(self._convert_road_to_lanelets, self._odr_map.get_paths())
+        list(map(self._convert_road_to_lanelets, self._odr_map.get_paths()))
 
         return self._lanelet2_map
 
-    def _create_point(self, waypoint, border):
+    def _create_point(self, location):
         uid = self._next_uid()
-
-        location = waypoint.transform.location
-        vector = waypoint.transform.get_right_vector()
-        if border == "left": vector *= -1
-        border_location = location + (waypoint.lane_width / 2.0) * vector
-
-        geolocation = self._odr_map.transform_to_geolocation(border_location)
+        
+        geolocation = self._odr_map.transform_to_geolocation(location)
         lat = geolocation.latitude
         lon = geolocation.longitude
         attributes = {
-            "ele": border_location.z,
-            "local_x": border_location.x,
-            "local_y": -border_location.y # From left-handed to right-handed system
+            "ele": location.z,
+            "local_x": location.x,
+            "local_y": -location.y # From left-handed to right-handed system
         }
 
         return lanelet2.Point(uid, lat, lon, attributes)
@@ -102,38 +89,96 @@ class Odr2Lanelet2Conversor(object):
 
         return lanelet2.Lanelet(uid, linestrings, attributes)
 
-    def _is_adjacent(self, lane_id, other_lane_id):
+    def _is_adjacent(self, road_id, section_id, lane_id, other_lane_id):
         direction = lane_id * other_lane_id
         difference = abs(lane_id - other_lane_id)
         if direction < 0 and difference > 2:
             return False
         if direction > 0 and difference > 1:
             return False
+
+        # Even if lanes are adjacent, check that they do not have same predecessros or successors.
+        # Some CARLA maps have wrong lane linkage between section:
+        #
+        #  *------------------*
+        #  |        L2        |
+        #  *------------------*------------------*
+        #  |        L1        |        L3        |
+        #  *------------------*------------------*
+        #
+        # In the exmaple above, opendrive linkage is L1->L3 amd L2->L3.
+        # By definition, L1 and L2 should be adjacent, however they are sharing the same successor.
+        # We detect this situation and mark these two lanes as NOT adjacents.
+        common_predecessors = set(self._odr_map.get_segment_predecessors(road_id, section_id, lane_id)) & \
+                              set(self._odr_map.get_segment_predecessors(road_id, section_id, other_lane_id))
+        if common_predecessors:
+            logging.warning(
+                "Segments {}|{}|{} and {}|{}|{} should be adjacent but sharing at least one predecessor {}|{}|{}".format(
+                    road_id, section_id, lane_id,
+                    road_id, section_id, other_lane_id,
+                    *list(common_predecessors)[0]
+                )
+            )
+            return False
+
+        common_successors = set(self._odr_map.get_segment_successors(road_id, section_id, lane_id)) & \
+                            set(self._odr_map.get_segment_successors(road_id, section_id, other_lane_id))
+        if common_successors:
+            logging.warning(
+                "Segment {}|{}|{} and {}|{}|{} should be adjacent but sharing at least one successor {}|{}|{}".format(
+                    road_id, section_id, lane_id,
+                    road_id, section_id, other_lane_id,
+                    *list(common_successors)[0]
+                )
+            )
+            return False
+
         return True
 
     def _convert_road_to_lanelets(self, road_id):
+
         for section_id in self._odr_map.get_sections(road_id):
+            # Lane sections of a same road are processed from smaller to higher lane ids.
+            #
+            #  *--------------*
+            #  |  LANE ID  1  |  ^
+            #  *--------------*  ^
+            #  |  LANE ID -1  |  ^
+            #  *--------------*  ^
+            #  |  LANE ID -2  |  ^
+            #  *--------------*
+            #
             for idx, lane_id in enumerate(self._odr_map.get_lanes(road_id, section_id)):
-                logging.debug("Processing {}, {}, {}".format(road_id, section_id, lane_id))
+                logging.debug("Processing {}|{}|{}".format(road_id, section_id, lane_id))
 
                 start_waypoint = self._odr_map.get_waypoint(road_id, section_id, lane_id)
-                reference_waypoints = self._create_reference_waypoints(start_waypoint)
+                end_waypoint = self._odr_map.get_waypoint_successors(road_id, section_id, lane_id)[0]
 
-                # Check predecessor and successor points.
-                predecessors = self._get_predecessor_points(road_id, section_id, lane_id)
-                successors = self._get_successor_points(road_id, section_id, lane_id)
+                # start_transform = start_waypoint.transform
+                # end_transform = end_waypoint.transform if end_waypoint else None
 
-                # For the initial (road_id, section_id, lane_id) combination with compute both the
-                # right border and the left border.
-                if idx == 0 or not self._is_adjacent(lane_id, last_lane_id):
-                    left_points = [self._create_point(wp, "left") for wp in reference_waypoints]
-                    right_points = [self._create_point(wp, "right") for wp in reference_waypoints]
+                pre, succ = self._get_link_points(road_id, section_id, lane_id)
 
-                    left_edge = map(self._lanelet2_map.add_point, left_points)
-                    right_edge = map(self._lanelet2_map.add_point, right_points)
+                reference_border = self._create_reference_border(start_waypoint, end_waypoint) 
+
+                # For the initial (road_id, section_id, lane_id) combination or lanes that are not adjacent, we compute
+                # both the right and the left border
+                if idx == 0 or not self._is_adjacent(road_id, section_id, lane_id, last_lane_id):
+
+                    left_points = [self._create_point(self._odr_map.get_border(start_waypoint, "left")) if not pre[0] else pre[0]]
+                    left_points += [self._create_point(loc) for loc in reference_border[0]]
+                    left_points += [self._create_point(self._odr_map.get_border(end_waypoint, "left")) if not succ[0] else succ[0]]
+
+                    right_points = [self._create_point(self._odr_map.get_border(start_waypoint, "right")) if not pre[1] else pre[1]]
+                    right_points += [self._create_point(loc) for loc in reference_border[1]]
+                    right_points += [self._create_point(self._odr_map.get_border(end_waypoint, "right")) if not succ[1] else succ[1]]
+
+                    left_edge = list(map(self._lanelet2_map.add_point, left_points))
+                    right_edge = list(map(self._lanelet2_map.add_point, right_points))
+
                     edges = (
-                        predecessors[0] + left_edge + successors[0],
-                        predecessors[1] + right_edge + successors[1]
+                        left_edge,
+                        right_edge
                     )
 
                     left_linestring = self._create_linestring(start_waypoint, edges[0], "left")
@@ -143,13 +188,28 @@ class Odr2Lanelet2Conversor(object):
                         self._lanelet2_map.add_linestring(right_linestring)
                     )
 
+                # For adjacent lanes we share right or left border
                 else:
+                    
+                    # If current lane id is negative, the right border is shared with the left border of the previous 
+                    # processed lane:
+                    #
+                    #  *--------------*
+                    #  |  LANE ID -1  |
+                    #  |    ---->     |  ^
+                    #  *--------------*  ^
+                    #  |  LANE ID -2  |  ^
+                    #  |    ---->     |  ^
+                    #  *--------------*
                     if lane_id < 0:
-                        left_points = [self._create_point(wp, "left") for wp in reference_waypoints]
 
-                        left_edge = map(self._lanelet2_map.add_point, left_points)
+                        left_points = [self._create_point(self._odr_map.get_border(start_waypoint, "left")) if not pre[0] else pre[0]]
+                        left_points += [self._create_point(loc) for loc in reference_border[0]]
+                        left_points += [self._create_point(self._odr_map.get_border(end_waypoint, "left")) if not succ[0] else succ[0]]
+
+                        left_edge = list(map(self._lanelet2_map.add_point, left_points))
                         edges = (
-                            predecessors[0] + left_edge + successors[0],
+                            left_edge,
                             last_edges[0][:]
                         )
 
@@ -159,12 +219,38 @@ class Odr2Lanelet2Conversor(object):
                             last_linestrings[0]
                         )
 
+                    # If current lane id is positive:
+                    #
+                    #    * If current lane id is equal to 1, the left border is shared with the left border of the
+                    #      previous processed lane in reversed order.
+                    #
+                    #        *--------------*
+                    #        |  LANE ID  1  |
+                    #        |    <----     |  ^
+                    #        *--------------*  ^
+                    #        |  LANE ID -1  |  ^
+                    #        |    ---->     |  ^
+                    #        *--------------*
+                    #
+                    #    * If current lane id is higher than 1, the left border is shared with the right border of the
+                    #      previous processed lane.
+                    #
+                    #        *--------------*
+                    #        |  LANE ID  2  |
+                    #        |    <----     |  ^
+                    #        *--------------*  ^
+                    #        |  LANE ID  1  |  ^
+                    #        |    <----     |  ^
+                    #        *--------------*
                     else:
-                        right_points = [self._create_point(wp, "right") for wp in reference_waypoints]
-                        right_edge = map(self._lanelet2_map.add_point, right_points)
+                        right_points = [self._create_point(self._odr_map.get_border(start_waypoint, "right")) if not pre[1] else pre[1]]
+                        right_points += [self._create_point(loc) for loc in reference_border[1]]
+                        right_points += [self._create_point(self._odr_map.get_border(end_waypoint, "right")) if not succ[1] else succ[1]]
+                        
+                        right_edge = list(map(self._lanelet2_map.add_point, right_points))
                         edges = (
                             last_edges[0][::-1] if lane_id == 1 else last_edges[1][:],
-                            predecessors[1] + right_edge + successors[1]
+                            right_edge
                         )
 
                         left_linestring = self._create_linestring(start_waypoint, edges[0], "left")
@@ -182,81 +268,384 @@ class Odr2Lanelet2Conversor(object):
                 last_linestrings = linestrings
                 last_lane_id = lane_id
 
-    def _create_reference_waypoints(self, start_waypoint):
-        """
-        Create reference list of waypoints.
+                #print("{}: Real points->".format(road_id), [(edges[0][0], edges[1][0]), (edges[0][-1], edges[1][-1])])
 
-        All the waypoints belonging to the reference list will have, by definition, the same road id,
+    def _create_reference_border(self, start_waypoint, end_waypoint):
+        """
+        Create reference list of transforms.
+
+        All the transforms belonging to the reference list will have, by definition, the same road id,
         section id and lane id.
         """
-        waypoints = [start_waypoint]
+        ltransforms = []
+        rtransforms = []
+
+        def _is_aligned(loc1, loc2, loc3):
+
+            dx1, dy1 = loc1.x - loc2.x, loc1.y - loc2.y
+            dx2, dy2 = loc2.x - loc3.x, loc2.y - loc3.y
+
+            angle1 = math.atan2(dx1, dy1)
+            angle2 = math.atan2(dx2, dy2)
+
+            THRESHOLD_ANGLE = 0.01
+            diff_angle = abs(angle1 - angle2)
+            if diff_angle < THRESHOLD_ANGLE:
+                return True
+            return False
+
+        # Create a buffer for both left and right border:
+        #
+        #    * Buffer: [current, candidate, look_ahead]
+        #
+        # The buffer consist of:
+        #    - `current`: last point added (start waypoint border at the begining)
+        #    - `candidate`: candidate point to be added.
+        #    - `look_ahead`: look ahead point to decide if candidate is added.
+        #
+        # Given diff = ( angle(current->candidate) - angle(candidate->look_ahead) ):
+        #
+        #    * If diff < THRESHOLD candidate is NOT added:
+        #        current -> current
+        #        candidate -> look_ahead
+        #        look_ahead -> None
+        #
+        #    * If diff > THRESHOLD candidate is added:
+        #        current -> candidate
+        #        candidate -> look_ahead
+        #        look_ahead -> None
+
+        lbuffer = [self._odr_map.get_border(start_waypoint, "left"), None, None]
+        rbuffer = [self._odr_map.get_border(start_waypoint, "right"), None, None]
 
         next_waypoint = start_waypoint.next(self.sampling_distance)
         while (len(next_waypoint) == 1
                and start_waypoint.road_id == next_waypoint[0].road_id
                and start_waypoint.section_id == next_waypoint[0].section_id):
-            waypoints.append(next_waypoint[0])
+            
+            # No candidate. This only happens during the first iteration
+            if lbuffer[1] == None and rbuffer[1] == None:
+                lbuffer[1] = self._odr_map.get_border(next_waypoint[0], "left")
+                rbuffer[1] = self._odr_map.get_border(next_waypoint[0], "right")
+  
+            else:
+                # Compute look ahead point
+                lbuffer[2] = self._odr_map.get_border(next_waypoint[0], "left")
+                rbuffer[2] = self._odr_map.get_border(next_waypoint[0], "right")
+
+                # Left border
+                if _is_aligned(*lbuffer):
+                    lbuffer[1] = lbuffer[2]
+                    lbuffer[2] = None
+                else:
+                    ltransforms.append(lbuffer[1])
+
+                    lbuffer[0] = lbuffer[1]
+                    lbuffer[1] = lbuffer[2]
+                    lbuffer[2] = None
+
+                # Right border
+                if _is_aligned(*rbuffer):
+                    rbuffer[1] = rbuffer[2]
+                    rbuffer[2] = None
+                else:
+                    rtransforms.append(rbuffer[1])
+
+                    rbuffer[0] = rbuffer[1]
+                    rbuffer[1] = rbuffer[2]
+                    rbuffer[2] = None
+
             next_waypoint = next_waypoint[0].next(self.sampling_distance)
 
-        return waypoints
+        # Check last candidate with the end waypoint
+        if end_waypoint and (lbuffer[1] != None and rbuffer[1] != None):
+            lbuffer[2] = self._odr_map.get_border(end_waypoint, "left")
+            rbuffer[2] = self._odr_map.get_border(end_waypoint, "right")
 
-    def _get_predecessor_points(self, road_id, section_id, lane_id):
-        """
-        Return predecessors points.
-        """
-        predecessors = self._odr_map.get_predecessors(road_id, section_id, lane_id)
-        if not predecessors:
-            return ([], [])
+            if not _is_aligned(*lbuffer):
+                ltransforms.append(lbuffer[1])
+            if not _is_aligned(*rbuffer):
+                rtransforms.append(rbuffer[1])
 
-        # TODO(joel): We get only the first predecessor?
-        predecessor = predecessors[0]
+        return ltransforms, rtransforms
 
-        if predecessor in self._odr2lanelet:
-            assert len(predecessors) == 1
+    def _get_link_points(self, road_id, section_id, lane_id):
 
-            lanelet_uid = self._odr2lanelet[predecessor]
-            borders = self._lanelet2_map.get_lanelet(lanelet_uid).borders
-            edges = (self._lanelet2_map.get_linestring(borders[0]).points,
-                     self._lanelet2_map.get_linestring(borders[1]).points)
+        # Keep track of the visited segments so we don't revisit the same segment twice when searching a point link
+        # candidate
+        visited_segments = set()
 
-            return ([edges[0][-1]], [edges[1][-1]])
+        def _is_segment_visited(road_id, section_id, lane_id, clear=False):
+            if clear:
+                visited_segments.clear()
 
-        return ([], [])
+            if (road_id, section_id, lane_id) in visited_segments:
+                return True
+            else:
+                visited_segments.add((road_id, section_id, lane_id))
+                return False
 
-    def _get_successor_points(self, road_id, section_id, lane_id):
-        """
-        Returns successors points.
-        """
-        successors = self._odr_map.get_successors(road_id, section_id, lane_id)
-        if not successors:
-            return ([], [])
+        # Search start-left link point.
+        #
+        #                           *--------------------*
+        #                           |    LEFT LANELET    |
+        #                           |       ---->        |
+        #                    point  |     ( <---- )      |
+        #  *-----------------------(*)-------------------*
+        #  |  PREDESSOR(s) LANELET  |  CURRENT LANELET   |
+        #  |          ---->         |       ---->        |
+        #  *------------------------*--------------------*
+        #
+        # When searching for the start-left link point:
+        #
+        #    * Check direct predecessors. It any direct predecessors has already been processed both left and right
+        #      points must exists. If no predecessors have been processed look for the end-left point of each
+        #      pedecessor.
+        #
+        #    * Check left neighbbour. Taking into account left neighbour lane direction and current lane direction:
+        #
+        #        - If SAME direction: Search start-right of the left neighbour.
+        #        - If DIFFERENT direction: Search end-left of the left neighbour.
 
-        # TODO(joel): We get only the first successor?
-        successor = successors[0]
+        def _get_start_left(road_id, section_id, lane_id, clear=False):
+            if _is_segment_visited(road_id, section_id, lane_id, clear):
+                return None
 
-        if successor in self._odr2lanelet:
-            assert len(successors) == 1
+            # Check direct predecessors
+            predecessors = self._odr_map.get_segment_predecessors(road_id, section_id, lane_id)
+            
+            # Check if any predecessor has already been processed
+            processed_predecessors = [p for p in predecessors if p in self._odr2lanelet]
+            
+            # If a direct predecessor has been processed both left and right points must exist
+            if processed_predecessors:
+                lpoint, _ = self._lanelet2_map.get_lanelet_end_points(self._odr2lanelet[processed_predecessors[0]])
+                return lpoint
 
-            lanelet_uid = self._odr2lanelet[successor]
-            borders = self._lanelet2_map.get_lanelet(lanelet_uid).borders
-            edges = (self._lanelet2_map.get_linestring(borders[0]).points,
-                     self._lanelet2_map.get_linestring(borders[1]).points)
+            # If no predecessors have been processed look for the end-left point of each pedecessor
+            else:
+                for predecessor in predecessors:
+                    point = _get_end_left(*predecessor)
+                    if point: return point
 
-            return ([edges[0][0]], [edges[1][0]])
+            # Check left neighbbour.
+            left = self._odr_map.get_left(road_id, section_id, lane_id)
+            if left:
+                _, _, left_lane_id = left
+                if (lane_id * left_lane_id > 0):  # same direction
+                    point = _get_start_right(*left)
+                    if point: return point
+                else:  # different direction
+                    point = _get_end_left(*left)
+                    if point: return point
 
-        return ([], [])
+        # Search start-right link point.
+        #
+        #  *------------------------*--------------------*
+        #  |  PREDESSOR(s) LANELET  |  CURRENT LANELET   |
+        #  |          ---->         |       ---->        |
+        #  *-----------------------(*)-------------------*
+        #                     point |   RIGHT LANELET    |
+        #                           |       ---->        |
+        #                           *--------------------*
+        #
+        # When searching for the start-right link point:
+        #
+        #    * Check direct predecessors. It any direct predecessors has already been processed both left and right
+        #      points must exists. If no predecessors have been processed look for the end-right point of each
+        #      pedecessor.
+        #
+        #    * Check right neighbbour and search for the start-left point. By denifition right neighbour lane direction
+        #      and current lane direction is always the smae.
 
+        def _get_start_right(road_id, section_id, lane_id, clear=False):
+            if _is_segment_visited(road_id, section_id, lane_id, clear):
+                return None
+
+            # Check direct predecessors
+            predecessors = self._odr_map.get_segment_predecessors(road_id, section_id, lane_id)
+
+            # Check if any predecessor has already been processed
+            processed_predecessors = [p for p in predecessors if p in self._odr2lanelet]
+
+            # If a direct predecessor has been processed both left and right points must exist
+            if processed_predecessors:
+                _, rpoint = self._lanelet2_map.get_lanelet_end_points(self._odr2lanelet[processed_predecessors[0]])
+                return rpoint
+
+            # If no predecessors have been processed look for the end-right point of each pedecessor
+            else:
+                for predecessor in predecessors:
+                    point = _get_end_right(*predecessor)
+                    if point: return point
+
+            # Check right neighbbour
+            right = self._odr_map.get_right(road_id, section_id, lane_id)
+            if right:
+                _, _, right_lane_id = right
+                assert lane_id * right_lane_id > 0
+                point = _get_start_left(*right)
+                if point: return point
+
+        # Search end-left link point.
+        #
+        #  *------------------ *
+        #  |    LEFT LANELET   |
+        #  |       ---->       |
+        #  |     ( <---- )     | point
+        #  *------------------(*)------------------------*
+        #  |  CURRENT LANELET  |  SUCCESSORS(s) LANELET  |
+        #  |       ---->       |          ---->          |
+        #  *-------------------*-------------------------*
+        #
+        # When searching for the end-left link point:
+        #
+        #    * Check direct successors. It any direct successor has already been processed both left and right points
+        #      must exists. If no successors have been processed yet, look for the start-left point of each successor.
+        #
+        #    * Check left neighbbour. Taking into account left neighbour lane direction and current lane direction:
+        #
+        #        - If SAME direction: Search end-right of the left neighbour.
+        #        - If DIFFERENT direction: Search start-left of the left neighbour.
+
+        def _get_end_left(road_id, section_id, lane_id, clear=False):
+            if _is_segment_visited(road_id, section_id, lane_id, clear):
+                return None
+
+            # Check direct successors
+            successors = self._odr_map.get_segment_successors(road_id, section_id, lane_id)
+
+            # Check if any successor has already been processed
+            processed_successors = [s for s in successors if s in self._odr2lanelet]
+
+            # If a direct successor has been processed both left and right points must exist
+            if processed_successors:
+                lpoint, _ = self._lanelet2_map.get_lanelet_start_points(self._odr2lanelet[processed_successors[0]])
+                return lpoint
+
+            # If no successors have been processed look for the start-left point of each pedecessor
+            else:
+                for successor in successors:
+                    point = _get_start_left(*successor)
+                    if point: return point
+
+            # Check left neighbour
+            left = self._odr_map.get_left(road_id, section_id, lane_id)
+            if left:
+                _, _, left_lane_id = left
+                if (lane_id * left_lane_id > 0):  # same direction
+                    point = _get_end_right(*left)
+                    if point: return point
+                else:  # different direction
+                    point = _get_start_left(*left)
+                    if point: return point
+
+        # Search end-right link point.
+        #
+        #  *-------------------*-------------------------*
+        #  |  CURRENT LANELET  |  SUCCESSORS(s) LANELET  |
+        #  |       ---->       |          ---->          |
+        #  *------------------(*)-------------------------*
+        #  |   RIGHT LANELET   | point
+        #  |       ---->       |
+        #  *-------------------*
+        #
+        # When searching for the end-right link point:
+        #
+        #    * Check direct successors. It any direct successor has already been processed both left and right points
+        #      must exists. If no successors have been processed yet, look for the start-right point of each successor.
+        #
+        #    * Check right neighbbour and search for the end-left point. By denifition right neighbour lane direction
+        #      and current lane direction is always the smae.
+
+        def _get_end_right(road_id, section_id, lane_id, clear=False):
+            if _is_segment_visited(road_id, section_id, lane_id, clear):
+                return None
+
+            # Check direct successors
+            successors = self._odr_map.get_segment_successors(road_id, section_id, lane_id)
+
+            # Check if any successor has already been processed
+            processed_successors = [s for s in successors if s in self._odr2lanelet]
+
+            # If a direct successor has been processed both left and right points must exist
+            if processed_successors:
+                _, rpoint = self._lanelet2_map.get_lanelet_start_points(self._odr2lanelet[processed_successors[0]])
+                return rpoint
+
+            # If no successors have been processed look for the start-right point of each pedecessor
+            else:
+                for successor in successors:
+                    point = _get_start_right(*successor)
+                    if point: return point
+
+            # Check right neighbour
+            right = self._odr_map.get_right(road_id, section_id, lane_id)
+            if right:
+                _, _, right_lane_id = right
+                assert lane_id * right_lane_id > 0
+                point = _get_end_left(*right)
+                if point: return point
+
+        lstart = _get_start_left(road_id, section_id, lane_id, True)
+        rstart = _get_start_right(road_id, section_id, lane_id, True)
+        lend = _get_end_left(road_id, section_id, lane_id, True)
+        rend = _get_end_right(road_id, section_id, lane_id, True)
+
+        points = [
+            (self._lanelet2_map.get_point(lstart), self._lanelet2_map.get_point(rstart)),
+            (self._lanelet2_map.get_point(lend), self._lanelet2_map.get_point(rend))
+        ]
+
+        #print("{}: Linked points->".format(road_id), points)
+
+        return points
+
+    def validate(self):
+        for road_id in self._odr_map.get_roads():
+            for section_id in self._odr_map.get_sections(road_id):
+                for lane_id in self._odr_map.get_lanes(road_id, section_id):
+
+                    predecessors = self._odr_map.get_segment_predecessors(road_id, section_id, lane_id)
+                    successors = self._odr_map.get_segment_successors(road_id, section_id, lane_id)
+
+                    predecessors_points = []
+                    for predecessor in predecessors:
+                        predecessors_points += [self._lanelet2_map.get_lanelet_end_points(self._odr2lanelet[predecessor])]
+                
+                    successors_points = []
+                    for successor in successors:
+                        successors_points += [self._lanelet2_map.get_lanelet_start_points(self._odr2lanelet[successor])]
+
+                    if not all(p == predecessors_points[0] for p in predecessors_points) or \
+                       not all(s == successors_points[0] for s in successors_points):
+
+                        logging.warning(
+                            "Segment {}|{}|{} do not share the same points with all predecessors and/or successors.\n Predecessors: {}, Successors: {}".format(
+                                road_id, section_id, lane_id,
+                                predecessors_points,
+                                successors_points
+                            )
+                        )
 
 def odr2lanelet2(xodr_file, output, sampling_distance):
+    logging.info("Loading opendrive...")
     odr_map = opendrive.load_map(xodr_file)
 
     conversor = Odr2Lanelet2Conversor(sampling_distance)
     lanelet2_map = conversor(odr_map)
+
+    logging.info("Saving...")
     lanelet2.save(lanelet2_map, output)
-    print("Conversion completed!!!")
-    print("Total points: {}".format(len(lanelet2_map._points)))
-    print("Total linestrings: {}".format(len(lanelet2_map._linestrings)))
-    print("Total lanelets: {}".format(len(lanelet2_map._lanelets)))
+
+    logging.info("""Conversion completed:
+      * Total points {}
+      * Total linestrings: {}
+      * Total lanelets: {}""".format(
+        len(lanelet2_map._points),
+        len(lanelet2_map._linestrings),
+        len(lanelet2_map._lanelets))
+    )
 
 
 if __name__ == '__main__':

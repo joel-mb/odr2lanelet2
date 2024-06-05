@@ -1,3 +1,3 @@
 
-from odr_map import load_map, OdrMap
+from .odr_map import load_map, OdrMap
 

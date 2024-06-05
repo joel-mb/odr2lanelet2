@@ -1,10 +1,4 @@
-#!/usr/bin/env python
 
-# Copyright (c) 2020 Computer Vision Center (CVC) at the Universitat Autonoma de
-# Barcelona (UAB).
-#
-# This work is licensed under the terms of the MIT license.
-# For a copy, see <https://opensource.org/licenses/MIT>.
 
 class Primitive(object):
     def __init__(self, uid, attributes={}):
@@ -13,6 +7,7 @@ class Primitive(object):
 
     def get_attribute(self, key):
         return self.attributes.get(key, None)
+
 
 class Point(Primitive):
     def __init__(self, uid, lat, lon, attributes={}):
@@ -24,11 +19,13 @@ class Point(Primitive):
         self.version = "1"
         self.visible = True
 
+
 class Linestring(Primitive):
     def __init__(self, uid, points, attributes={}):
         super(Linestring, self).__init__(uid, attributes)
 
         self.points = points
+
 
 class Lanelet(Primitive):
     def __init__(self, uid, borders, attributes={}):
@@ -38,4 +35,3 @@ class Lanelet(Primitive):
 
     def get_border(self, border):
         return self.borders[0] if border == "left" else self.borders[1]
-

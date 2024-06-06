@@ -45,6 +45,8 @@ class Odr2Lanelet2Conversor(object):
         list(map(self._convert_road_to_lanelets, self._odr_map.get_std_roads()))
         logging.debug("Processing paths")
         list(map(self._convert_road_to_lanelets, self._odr_map.get_paths()))
+        logging.debug("Processing crosswalks")
+        list(map(self._convert_crosswalk_to_lanelet, self._odr_map.get_crosswalks()))
 
         return self._lanelet2_map
 
@@ -600,6 +602,50 @@ class Odr2Lanelet2Conversor(object):
         #print("{}: Linked points->".format(road_id), points)
 
         return points
+
+    def _convert_crosswalk_to_lanelet(self, crosswalk):
+        
+        # A crosswalk is defined in the following way:
+        #
+        #            left border
+        #    (p1)----------------->(p4)
+        #     |                     |
+        #     |      CROSSWLAK      |
+        #     |                     |
+        #    (p2)----------------->(p3)
+        #           right border
+        #
+        # TODO: https://github.com/autowarefoundation/autoware_common/blob/main/tmp/lanelet2_extension/docs/lanelet2_format_extension.md#crosswalk
+
+        p1, p2, p3, p4 = crosswalk
+
+        left = [
+            self._lanelet2_map.add_point(self._create_point(p1)),
+            self._lanelet2_map.add_point(self._create_point(p4))
+        ]
+        right = [
+            self._lanelet2_map.add_point(self._create_point(p2)),
+            self._lanelet2_map.add_point(self._create_point(p3))
+        ]
+
+        linestrings = [
+            self._lanelet2_map.add_linestring(lanelet2.Linestring(self._next_uid(), left, attributes={"type": "pedestrian_marking"})),
+            self._lanelet2_map.add_linestring(lanelet2.Linestring(self._next_uid(), right, attributes={"type": "pedestrian_marking"}))
+        ]
+
+        self._lanelet2_map.add_lanelet(
+            lanelet2.Lanelet(
+                self._next_uid(),
+                borders=linestrings,
+                attributes={
+                    "type": "lanelet",
+                    "subtype": "crosswalk",
+                    "speed_limit": "10",
+                    "location": "urban",
+                    "one_way": "no",
+                    "participant:pedestrian": "yes"}
+            )
+        )
 
     def validate(self):
         for road_id in self._odr_map.get_roads():

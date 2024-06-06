@@ -144,3 +144,14 @@ class OdrMap(object):
         if border == "left": vector *= -1
         border_location = location + (waypoint.lane_width / 2.0) * vector
         return border_location
+
+    def get_crosswalks(self):
+        crosswalk_points = self.carla_map.get_crosswalks()
+        assert len(crosswalk_points) % 5 == 0
+
+        crosswalks = []
+        for i in range(0, len(crosswalk_points), 5):
+            p1, p2, p3, p4, _ = crosswalk_points[i:i+5]
+            crosswalks.append((p1, p2, p3, p4))
+
+        return crosswalks

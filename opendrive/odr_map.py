@@ -1,18 +1,33 @@
 import collections
+import logging
 import math
 
 import carla
 
 
-def load_map(xodr_file):
-    with open(xodr_file, 'r') as f:
-        carla_map = carla.Map('odr2lanelet2', str(f.read()))
-    return OdrMap(carla_map)
+def load_map(xodr_file, use_carla_server=False):
+    if not use_carla_server:
+        with open(xodr_file, 'r') as f:
+            carla_map = carla.Map("odr2lanelet2", str(f.read()))
+        return OdrMap(carla_map)
+    else:
+        logging.info(("Connecting to CARLA server..."))
+        if xodr_file:
+            logging.warning("Using map loaded in the CARLA server. User provided map will be ignored")
+
+        client = carla.Client("localhost", 2000)
+        client.set_timeout(60.0)
+
+        carla_world = client.get_world()
+        carla_map = carla_world.get_map()
+
+        return OdrMap(carla_map, carla_world)
 
 
 class OdrMap(object):
-    def __init__(self, carla_map):
+    def __init__(self, carla_map, carla_world=None):
         self.carla_map = carla_map
+        self.carla_world = carla_world
 
         carla_topology = self.carla_map.get_topology()
 
@@ -155,3 +170,77 @@ class OdrMap(object):
             crosswalks.append((p1, p2, p3, p4))
 
         return crosswalks
+
+    def get_traffic_lights(self):
+
+        if not self.carla_world:
+            return []
+
+        # boxes
+        traffic_lights = {}
+        for traffic_light in self.carla_world.get_actors().filter('traffic.traffic_light'):
+
+            component_names = list(filter(lambda c: c.startswith("box"), traffic_light.get_component_names()))
+            # Each traffic light boz has 7 components defining:
+            #    * top_left, top_right, bottom_left, bottom_right
+            #    * green light bulb, yellow light bulb, red light bulb
+            #
+            #    (1)-----(2)
+            #     |  (5)  |
+            #     |  (6)  |
+            #     |  (7)  |
+            #    (3)-----(4)
+            nboxes = int(len(component_names) / 7)
+
+            traffic_lights[traffic_light.id] = {
+                "nboxes": nboxes,
+                "boxes": [],
+                "landmarks": []
+            }
+
+            for box in range(1, nboxes + 1):
+                bottom_left = traffic_light.get_component_world_transform("box{}_bottom_left".format(box)).location
+                bottom_right = traffic_light.get_component_world_transform("box{}_bottom_right".format(box)).location
+
+                top_left = traffic_light.get_component_world_transform("box{}_top_left".format(box)).location
+                top_right = traffic_light.get_component_world_transform("box{}_top_right".format(box)).location
+
+                green_bulb = traffic_light.get_component_world_transform("box{}_bulb_green".format(box)).location
+                yellow_bulb = traffic_light.get_component_world_transform("box{}_bulb_yellow".format(box)).location
+                red_bulb = traffic_light.get_component_world_transform("box{}_bulb_red".format(box)).location
+
+                height = round(bottom_left.distance(top_left), 2)
+
+                traffic_lights[traffic_light.id]["boxes"].append({
+                    "left": bottom_left,
+                    "right": bottom_right,
+                    "height": height,
+                    "bulbs": {"green": green_bulb, "yellow": yellow_bulb, "red": red_bulb}
+                })
+
+        # landmarks (stop line)
+        landmarks = self.carla_map.get_all_landmarks_of_type('1000001')
+        for landmark in landmarks:
+            if landmark.name == '':
+                # This is a workaround to avoid adding traffic lights without controllers.
+                continue
+
+            traffic_light = self.carla_world.get_traffic_light(landmark)
+            if not traffic_light:
+                print("Warning!")
+
+            for from_lane, to_lane in landmark.get_lane_validities():
+                for lane_id in range(from_lane, to_lane + 1):
+                    if lane_id == 0:
+                        continue
+
+                    wp = self.carla_map.get_waypoint_xodr(landmark.road_id, lane_id, landmark.s)
+                    if wp is None:
+                        print(
+                            'Could not find waypoint for landmark {} (road_id: {}, lane_id: {}, s:{}'.
+                            format(landmark.id, landmark.road_id, lane_id, landmark.s))
+                        continue
+
+                    traffic_lights[traffic_light.id]["landmarks"].append(wp)
+
+        return traffic_lights.values()

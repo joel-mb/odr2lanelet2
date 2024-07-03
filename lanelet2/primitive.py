@@ -1,8 +1,11 @@
 
-
 class Primitive(object):
     def __init__(self, uid, attributes={}):
         self.uid = uid
+
+        self.version = "1"
+        self.visible = True
+
         self.attributes = attributes
 
     def get_attribute(self, key):
@@ -16,9 +19,6 @@ class Point(Primitive):
         self.lat = lat
         self.lon = lon
 
-        self.version = "1"
-        self.visible = True
-
 
 class Linestring(Primitive):
     def __init__(self, uid, points, attributes={}):
@@ -28,10 +28,22 @@ class Linestring(Primitive):
 
 
 class Lanelet(Primitive):
-    def __init__(self, uid, borders, attributes={}):
+    def __init__(self, uid, left, right, regulatory_elements=[], attributes={}):
         super(Lanelet, self).__init__(uid, attributes)
 
-        self.borders = borders
+        # lanelet borders
+        self.left = left
+        self.right = right
 
-    def get_border(self, border):
-        return self.borders[0] if border == "left" else self.borders[1]
+        self.regulatory_elements = regulatory_elements
+
+    def add_regulatory_element(self, regulatory_element):
+        self.regulatory_elements.append(regulatory_element)
+
+
+class RegulatoryElement(Primitive):
+
+    def __init__(self, uid, parameters={}, attributes={}):
+        super(RegulatoryElement, self).__init__(uid, attributes)
+
+        self.parameters = parameters

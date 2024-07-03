@@ -41,16 +41,18 @@ class Odr2Lanelet2Conversor(object):
         self._lanelet2_map = lanelet2.Lanelet2Map()
         self._odr2lanelet = {}
 
-        logging.debug("Processing standard roads")
+        logging.info("Processing standard roads")
         list(map(self._convert_road_to_lanelets, self._odr_map.get_std_roads()))
-        logging.debug("Processing paths")
+        logging.info("Processing paths")
         list(map(self._convert_road_to_lanelets, self._odr_map.get_paths()))
-        logging.debug("Processing crosswalks")
+        logging.info("Processing crosswalks")
         list(map(self._convert_crosswalk_to_lanelet, self._odr_map.get_crosswalks()))
+        logging.info("Processing traffic lights")
+        list(map(self._convert_traffic_light_to_regulatory_element, self._odr_map.get_traffic_lights()))
 
         return self._lanelet2_map
 
-    def _create_point(self, location):
+    def _create_point(self, location, extra_attributes={}):
         uid = self._next_uid()
         
         geolocation = self._odr_map.transform_to_geolocation(location)
@@ -62,34 +64,7 @@ class Odr2Lanelet2Conversor(object):
             "local_y": -location.y # From left-handed to right-handed system
         }
 
-        return lanelet2.Point(uid, lat, lon, attributes)
-
-    def _create_linestring(self, start_waypoint, points, border):
-        # assert len(points) > 1
-        uid = self._next_uid()
-
-        if border == 'left':
-            carla_marking = start_waypoint.left_lane_marking
-        else:
-            carla_marking = start_waypoint.right_lane_marking
-
-        attributes = Bridge.lanelet2_marking(carla_marking)
-        if start_waypoint.is_junction:
-            attributes = {'type': 'virtual'}
-
-        return lanelet2.Linestring(uid, points, attributes)
-
-    def _create_lanelet(self, start_waypoint, linestrings):
-        uid = self._next_uid()
-        attributes = {
-            "location": "urban",
-            "one_way": "no",
-            "region": "de",
-            "subtype": "road",
-            "type": "lanelet"
-        }
-
-        return lanelet2.Lanelet(uid, linestrings, attributes)
+        return lanelet2.Point(uid, lat, lon, {**attributes, **extra_attributes})
 
     def _is_adjacent(self, road_id, section_id, lane_id, other_lane_id):
         direction = lane_id * other_lane_id
@@ -139,6 +114,20 @@ class Odr2Lanelet2Conversor(object):
 
     def _convert_road_to_lanelets(self, road_id):
 
+        def _create_border_linestring(start_waypoint, points, border):
+            uid = self._next_uid()
+
+            if border == "left":
+                carla_marking = start_waypoint.left_lane_marking
+            else:
+                carla_marking = start_waypoint.right_lane_marking
+
+            attributes = Bridge.lanelet2_marking(carla_marking)
+            if start_waypoint.is_junction:
+                attributes = {"type": "virtual"}
+
+            return lanelet2.Linestring(uid, points, attributes)
+
         for section_id in self._odr_map.get_sections(road_id):
             # Lane sections of a same road are processed from smaller to higher lane ids.
             #
@@ -183,8 +172,8 @@ class Odr2Lanelet2Conversor(object):
                         right_edge
                     )
 
-                    left_linestring = self._create_linestring(start_waypoint, edges[0], "left")
-                    right_linestring = self._create_linestring(start_waypoint, edges[1], "right")
+                    left_linestring = _create_border_linestring(start_waypoint, edges[0], "left")
+                    right_linestring = _create_border_linestring(start_waypoint, edges[1], "right")
                     linestrings = (
                         self._lanelet2_map.add_linestring(left_linestring),
                         self._lanelet2_map.add_linestring(right_linestring)
@@ -215,7 +204,7 @@ class Odr2Lanelet2Conversor(object):
                             last_edges[0][:]
                         )
 
-                        left_linestring = self._create_linestring(start_waypoint, edges[0], "left")
+                        left_linestring = _create_border_linestring(start_waypoint, edges[0], "left")
                         linestrings = (
                             self._lanelet2_map.add_linestring(left_linestring),
                             last_linestrings[0]
@@ -248,21 +237,34 @@ class Odr2Lanelet2Conversor(object):
                         right_points = [self._create_point(self._odr_map.get_border(start_waypoint, "right")) if not pre[1] else pre[1]]
                         right_points += [self._create_point(loc) for loc in reference_border[1]]
                         right_points += [self._create_point(self._odr_map.get_border(end_waypoint, "right")) if not succ[1] else succ[1]]
-                        
+
                         right_edge = list(map(self._lanelet2_map.add_point, right_points))
                         edges = (
                             last_edges[0][::-1] if lane_id == 1 else last_edges[1][:],
                             right_edge
                         )
 
-                        left_linestring = self._create_linestring(start_waypoint, edges[0], "left")
-                        right_linestring = self._create_linestring(start_waypoint, edges[1], "right")
+                        left_linestring = _create_border_linestring(start_waypoint, edges[0], "left")
+                        right_linestring = _create_border_linestring(start_waypoint, edges[1], "right")
                         linestrings = (
                             self._lanelet2_map.add_linestring(left_linestring) if lane_id == 1 else last_linestrings[1],
                             self._lanelet2_map.add_linestring(right_linestring)
                         )
 
-                lanelet = self._create_lanelet(start_waypoint, linestrings)
+                lanelet = lanelet2.Lanelet(
+                    uid=self._next_uid(),
+                    left=linestrings[0],
+                    right=linestrings[1],
+                    regulatory_elements=[],
+                    attributes = {
+                        "type": "lanelet",
+                        "subtype": "road",
+                        "location": "urban",
+                        "one_way": "yes",
+                        "speed_limit": "30",
+                        "turn_direction": "" # TODO
+                    }
+                )
                 lanelet_uid = self._lanelet2_map.add_lanelet(lanelet)
                 self._odr2lanelet[road_id, section_id, lane_id] = lanelet_uid
 
@@ -324,7 +326,17 @@ class Odr2Lanelet2Conversor(object):
         while (len(next_waypoint) == 1
                and start_waypoint.road_id == next_waypoint[0].road_id
                and start_waypoint.section_id == next_waypoint[0].section_id):
-            
+
+            # If end_waypoint is provided check that the distance between next waypoint and end waypoint is higher
+            # than the sampling distance. Otherwise break the loop.
+            if end_waypoint:
+                next_location = next_waypoint[0].transform.location
+                end_location = end_waypoint.transform.location
+
+                distance = next_location.distance(end_location)
+                if distance < self.sampling_distance:
+                    break
+
             # No candidate. This only happens during the first iteration
             if lbuffer[1] == None and rbuffer[1] == None:
                 lbuffer[1] = self._odr_map.get_border(next_waypoint[0], "left")
@@ -635,17 +647,92 @@ class Odr2Lanelet2Conversor(object):
 
         self._lanelet2_map.add_lanelet(
             lanelet2.Lanelet(
-                self._next_uid(),
-                borders=linestrings,
+                uid=self._next_uid(),
+                left=linestrings[0],
+                right=linestrings[1],
                 attributes={
                     "type": "lanelet",
                     "subtype": "crosswalk",
-                    "speed_limit": "10",
                     "location": "urban",
                     "one_way": "no",
+                    "speed_limit": "10",
                     "participant:pedestrian": "yes"}
             )
         )
+
+    def _convert_traffic_light_to_regulatory_element(self, traffic_light):
+        # https://github.com/autowarefoundation/autoware_common/blob/main/tmp/lanelet2_extension/docs/lanelet2_format_extension.md#trafficlights
+        # https://github.com/autowarefoundation/autoware_common/blob/main/tmp/lanelet2_extension/docs/lanelet2_format_extension.md#light-bulbs-in-traffic-lights
+
+        boxes, bulbs = [], []
+        for box in traffic_light["boxes"]:
+
+            # Linestring defining the traffic light box
+            light_box = self._lanelet2_map.add_linestring(lanelet2.Linestring(
+                uid=self._next_uid(),
+                points=[
+                    self._lanelet2_map.add_point(self._create_point(box["left"])),
+                    self._lanelet2_map.add_point(self._create_point(box["right"]))
+                ],
+                attributes={
+                    "type": "traffic_light",
+                    "subtype": "red_yellow_green",
+                    "height": box["height"]
+                }
+            ))
+            boxes.append(light_box)
+
+            # Linestring defining traffic light bulbs
+            light_bulbs = self._lanelet2_map.add_linestring(lanelet2.Linestring(
+                uid=self._next_uid(),
+                points=[
+                    self._lanelet2_map.add_point(self._create_point(box["bulbs"]["green"], extra_attributes={"color": "green"})),
+                    self._lanelet2_map.add_point(self._create_point(box["bulbs"]["yellow"], extra_attributes={"color": "yellow"})),
+                    self._lanelet2_map.add_point(self._create_point(box["bulbs"]["red"], extra_attributes={"color": "red"})),
+                ],
+                attributes={
+                    "type": "light_bulbs",
+                    "traffic_light_id": light_box
+                }
+            ))
+            bulbs.append(light_bulbs)
+
+        # For each landmark associated to this traffic light
+        for waypoint in traffic_light["landmarks"]:
+            segment = waypoint.road_id, waypoint.section_id, waypoint.lane_id
+
+            # Linestring defining stop line.
+            stop_line_waypoint = waypoint
+            stop_line = self._lanelet2_map.add_linestring(lanelet2.Linestring(
+                uid=self._next_uid(),
+                points=[
+                    self._lanelet2_map.add_point(self._create_point(self._odr_map.get_border(stop_line_waypoint, "left"))),
+                    self._lanelet2_map.add_point(self._create_point(self._odr_map.get_border(stop_line_waypoint, "point"))),
+
+                ],
+                attributes={
+                    "type": "stop_line"
+                }
+            ))
+
+            # Regulatory element defining the traffic light
+            regulatory_element = self._lanelet2_map.add_regulatory_element(lanelet2.RegulatoryElement(
+                uid=self._next_uid(),
+                parameters={
+                    "refers": boxes,
+                    "ref_line": [stop_line],
+                    "light_bulbs": bulbs
+                },
+                attributes={
+                    "type": "regulatory_element",
+                    "subtype": "traffic_light"
+                }
+            ))
+
+            # Add the regulatory element to the affected road lanelet
+            lanelet = self._lanelet2_map.get_lanelet(self._odr2lanelet[segment])
+            lanelet.add_regulatory_element(regulatory_element)            
+            #print(lanelet.regulatory_elements)
 
     def validate(self):
         for road_id in self._odr_map.get_roads():
@@ -674,15 +761,15 @@ class Odr2Lanelet2Conversor(object):
                             )
                         )
 
-def odr2lanelet2(xodr_file, output, sampling_distance):
+def odr2lanelet2(xodr_file, lanelet2_file, sampling_distance, use_carla_server):
     logging.info("Loading opendrive...")
-    odr_map = opendrive.load_map(xodr_file)
+    odr_map = opendrive.load_map(xodr_file, use_carla_server)
 
     conversor = Odr2Lanelet2Conversor(sampling_distance)
     lanelet2_map = conversor(odr_map)
 
     logging.info("Saving...")
-    lanelet2.save(lanelet2_map, output)
+    lanelet2.save(lanelet2_map, lanelet2_file)
 
     logging.info("""Conversion completed:
       * Total points {}
@@ -693,14 +780,22 @@ def odr2lanelet2(xodr_file, output, sampling_distance):
         len(lanelet2_map._lanelets))
     )
 
+    logging.info("Validating...")
+    conversor.validate()
+
 
 if __name__ == '__main__':
     argparser = argparse.ArgumentParser(description=__doc__)
-    argparser.add_argument('xodr_file', help='opendrive file (*.xodr')
+    argparser.add_argument('--input',
+                           '-i',
+                           help="input (*.xodr)")
     argparser.add_argument('--output',
                            '-o',
-                           default="lanele2.osm",
+                           default="lanelet2.osm",
                            help="output (*.osm)")
+    argparser.add_argument('--carla',
+                           action='store_true',
+                           help='use carla server')
     argparser.add_argument('--debug',
                            '-v',
                            action='store_true',
@@ -714,4 +809,4 @@ if __name__ == '__main__':
         logging.basicConfig(format='%(levelname)s: %(message)s',
                             level=logging.INFO)
 
-    odr2lanelet2(args.xodr_file, args.output, sampling_distance=1.0)
+    odr2lanelet2(args.input, args.output, sampling_distance=1.0, use_carla_server=args.carla)

@@ -160,6 +160,46 @@ class OdrMap(object):
         border_location = location + (waypoint.lane_width / 2.0) * vector
         return border_location
 
+    # FIXME: This only works for simple intersections (i.e., turns smaller than 180 degrees).
+    def get_turn_direction(self, road_id, section_id, lane_id):
+
+        def _first_waypoint(road_id, section_id, lane_id):
+            predecessors = self.get_segment_predecessors(road_id, section_id, lane_id)
+
+            # If there are more than one predecessor or predecessor road id is different from the target road id,
+            # this is the first section
+            if len(predecessors) > 1 or predecessors[0][0] != road_id:
+                return self.get_waypoint(road_id, section_id, lane_id)
+
+            return _first_waypoint(*predecessors[0])
+
+        def _last_waypoint(road_id, section_id, lane_id):
+            successors = self.get_segment_successors(road_id, section_id, lane_id)
+
+            # If there are more than one successor or successor road id is different from the target road id,
+            # this is the latest section
+            if len(successors) > 1 or successors[0][0] != road_id:
+                return self.get_waypoint(*successors[0])
+
+            return _last_waypoint(*successors[0])
+
+        first_waypoint = _first_waypoint(road_id, section_id, lane_id)
+        last_waypoint = _last_waypoint(road_id, section_id, lane_id)
+
+        first_vector = first_waypoint.transform.rotation.get_forward_vector()
+        last_vector = last_waypoint.transform.rotation.get_forward_vector()
+
+        cross = first_vector.cross(last_vector)
+        dot = first_vector.dot(last_vector)
+
+        if dot > math.cos(45):
+            return "straight"
+        else:
+            if cross.z < 0:
+                return "left"
+            else:
+                return "right"
+
     def get_crosswalks(self):
         crosswalk_points = self.carla_map.get_crosswalks()
         assert len(crosswalk_points) % 5 == 0
@@ -181,7 +221,7 @@ class OdrMap(object):
         for traffic_light in self.carla_world.get_actors().filter('traffic.traffic_light'):
 
             component_names = list(filter(lambda c: c.startswith("box"), traffic_light.get_component_names()))
-            # Each traffic light boz has 7 components defining:
+            # Each traffic light box has 7 components defining:
             #    * top_left, top_right, bottom_left, bottom_right
             #    * green light bulb, yellow light bulb, red light bulb
             #

@@ -115,18 +115,48 @@ class Odr2Lanelet2Conversor(object):
     def _convert_road_to_lanelets(self, road_id):
 
         def _create_border_linestring(start_waypoint, points, border):
-            uid = self._next_uid()
-
+            road_id, section_id, lane_id = start_waypoint.road_id, start_waypoint.section_id, start_waypoint.lane_id
             if border == "left":
                 carla_marking = start_waypoint.left_lane_marking
+                left = self._odr_map.get_left(road_id, section_id, lane_id)
+                has_neighbour = left is not None and left[2]*lane_id > 0
             else:
                 carla_marking = start_waypoint.right_lane_marking
+                right = self._odr_map.get_right(road_id, section_id, lane_id)
+                has_neighbour = right is not None and right[2]*lane_id > 0
 
-            attributes = Bridge.lanelet2_marking(carla_marking)
+            attributes = Bridge.lanelet2_marking(carla_marking, has_neighbour)
+            # TODO: Fix lane change in intersections (e.g., highway entrance)
             if start_waypoint.is_junction:
                 attributes = {"type": "virtual"}
 
-            return lanelet2.Linestring(uid, points, attributes)
+            return lanelet2.Linestring(
+                uid=self._next_uid(),
+                points=points,
+                attributes=attributes
+            )
+
+        def _create_lanelet(start_waypoint, linestrings):
+            road_id, section_id, lane_id = start_waypoint.road_id, start_waypoint.section_id, start_waypoint.lane_id
+
+            turn_direction = ""
+            if start_waypoint.is_junction:
+                turn_direction = self._odr_map.get_turn_direction(road_id, section_id, lane_id)
+
+            return lanelet2.Lanelet(
+                uid=self._next_uid(),
+                left=linestrings[0],
+                right=linestrings[1],
+                regulatory_elements=[],
+                attributes = {
+                    "type": "lanelet",
+                    "subtype": "road",
+                    "location": "urban",
+                    "one_way": "yes",
+                    "speed_limit": "30",
+                    "turn_direction": turn_direction
+                }
+            )
 
         for section_id in self._odr_map.get_sections(road_id):
             # Lane sections of a same road are processed from smaller to higher lane ids.
@@ -251,20 +281,7 @@ class Odr2Lanelet2Conversor(object):
                             self._lanelet2_map.add_linestring(right_linestring)
                         )
 
-                lanelet = lanelet2.Lanelet(
-                    uid=self._next_uid(),
-                    left=linestrings[0],
-                    right=linestrings[1],
-                    regulatory_elements=[],
-                    attributes = {
-                        "type": "lanelet",
-                        "subtype": "road",
-                        "location": "urban",
-                        "one_way": "yes",
-                        "speed_limit": "30",
-                        "turn_direction": "" # TODO
-                    }
-                )
+                lanelet = _create_lanelet(start_waypoint, linestrings)
                 lanelet_uid = self._lanelet2_map.add_lanelet(lanelet)
                 self._odr2lanelet[road_id, section_id, lane_id] = lanelet_uid
 

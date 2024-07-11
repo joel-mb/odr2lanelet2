@@ -211,6 +211,47 @@ class OdrMap(object):
 
         return crosswalks
 
+    def get_stop_signs(self):
+
+        if not self.carla_world:
+            return []
+
+        stop_signs = {}
+
+        for stop_sign in self.carla_world.get_actors().filter('traffic.stop'):
+
+            # FIXME: Add STOP sign shape?
+            p1 = stop_sign.get_transform().location
+            p2 = p1 + stop_sign.get_transform().rotation.get_up_vector() * 1.4
+
+            stop_signs[stop_sign.id] = {
+                "shape": [p1, p2],
+                "landmarks": []
+            }
+
+        landmarks = self.carla_map.get_all_landmarks_of_type('206')
+        for landmark in landmarks:
+            stop_sign = self.carla_world.get_traffic_sign(landmark)
+            if not stop_sign:
+                logging.warning("Landmark {} is not associated with any actor".format(landmark.id))
+                continue
+
+            for from_lane, to_lane in landmark.get_lane_validities():
+                for lane_id in range(from_lane, to_lane + 1):
+                    if lane_id == 0:
+                        continue
+
+                    wp = self.carla_map.get_waypoint_xodr(landmark.road_id, lane_id, landmark.s)
+                    if wp is None:
+                        print(
+                            'Could not find waypoint for landmark {} (road_id: {}, lane_id: {}, s:{}'.
+                            format(landmark.id, landmark.road_id, lane_id, landmark.s))
+                        continue
+
+                    stop_signs[stop_sign.id]["landmarks"].append(wp)
+
+        return stop_signs.values()
+
     def get_traffic_lights(self):
 
         if not self.carla_world:
@@ -267,7 +308,8 @@ class OdrMap(object):
 
             traffic_light = self.carla_world.get_traffic_light(landmark)
             if not traffic_light:
-                print("Warning!")
+                logging.warning("Landmark {} is not associated with any actor".format(landmark.id))
+                continue
 
             for from_lane, to_lane in landmark.get_lane_validities():
                 for lane_id in range(from_lane, to_lane + 1):

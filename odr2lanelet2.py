@@ -47,6 +47,8 @@ class Odr2Lanelet2Conversor(object):
         list(map(self._convert_road_to_lanelets, self._odr_map.get_paths()))
         logging.info("Processing crosswalks")
         list(map(self._convert_crosswalk_to_lanelet, self._odr_map.get_crosswalks()))
+        logging.info("Processing stop signs")
+        list(map(self._convert_stop_sign_to_regulatory_element, self._odr_map.get_stop_signs()))
         logging.info("Processing traffic lights")
         list(map(self._convert_traffic_light_to_regulatory_element, self._odr_map.get_traffic_lights()))
 
@@ -676,6 +678,56 @@ class Odr2Lanelet2Conversor(object):
                     "participant:pedestrian": "yes"}
             )
         )
+
+    def _convert_stop_sign_to_regulatory_element(self, stop_sign):
+
+        # Linestring defining the stop sign
+        stop = self._lanelet2_map.add_linestring(lanelet2.Linestring(
+            uid=self._next_uid(),
+            points=[
+                self._lanelet2_map.add_point(self._create_point(stop_sign["shape"][0])),
+                self._lanelet2_map.add_point(self._create_point(stop_sign["shape"][1]))
+            ],
+            attributes={
+                "type": "traffic_sign",
+                "subtype": "stop_sign"
+            }
+        ))
+
+        # For each landmark associated to this stop sign
+        for waypoint in stop_sign["landmarks"]:
+            segment = waypoint.road_id, waypoint.section_id, waypoint.lane_id
+
+            # Linestring defining stop line.
+            stop_line_waypoint = waypoint
+            stop_line = self._lanelet2_map.add_linestring(lanelet2.Linestring(
+                uid=self._next_uid(),
+                points=[
+                    self._lanelet2_map.add_point(self._create_point(self._odr_map.get_border(stop_line_waypoint, "left"))),
+                    self._lanelet2_map.add_point(self._create_point(self._odr_map.get_border(stop_line_waypoint, "point"))),
+
+                ],
+                attributes={
+                    "type": "stop_line"
+                }
+            ))
+
+            # Regulatory element defining the stop sign
+            regulatory_element = self._lanelet2_map.add_regulatory_element(lanelet2.RegulatoryElement(
+                uid=self._next_uid(),
+                parameters={
+                    "refers": [stop],
+                    "ref_line": [stop_line]
+                },
+                attributes={
+                    "type": "regulatory_element",
+                    "subtype": "traffic_sign"
+                }
+            ))
+
+            # Add the regulatory element to the affected road lanelet
+            lanelet = self._lanelet2_map.get_lanelet(self._odr2lanelet[segment])
+            lanelet.add_regulatory_element(regulatory_element)            
 
     def _convert_traffic_light_to_regulatory_element(self, traffic_light):
         # https://github.com/autowarefoundation/autoware_common/blob/main/tmp/lanelet2_extension/docs/lanelet2_format_extension.md#trafficlights

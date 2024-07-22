@@ -19,6 +19,9 @@ class Lanelet2Map(object):
     def get_linestring(self, uid):
         return self._linestrings.get(uid, None)
 
+    def get_regulatory_element(self, uid):
+        return self._regulatory_elements.get(uid, None)
+
     def get_lanelet(self, uid):
         return self._lanelets.get(uid, None)
 
@@ -130,7 +133,7 @@ def save(lanelet2_map, filename):
         for role in regulatory_element.parameters.keys():
             for ref in regulatory_element.parameters[role]:
                 _ = ET.SubElement(relation_tag, "member", {
-                    "type": "way",
+                    "type": "way" if str(ref) in lanelet2_map._linestrings else "relation",
                     "ref": str(ref),
                     "role": role
                 })

@@ -5,8 +5,13 @@
 # ==================================================================================================
 
 import argparse
+import collections
+import itertools
 import logging
 import math
+
+import shapely.geometry
+#import matplotlib.pyplot as plt
 
 import lanelet2
 import opendrive
@@ -47,10 +52,12 @@ class Odr2Lanelet2Conversor(object):
         list(map(self._convert_road_to_lanelets, self._odr_map.get_paths()))
         logging.info("Processing crosswalks")
         list(map(self._convert_crosswalk_to_lanelet, self._odr_map.get_crosswalks()))
-        logging.info("Processing stop signs")
-        list(map(self._convert_stop_sign_to_regulatory_element, self._odr_map.get_stop_signs()))
+        logging.info("Processing traffic signs")
+        list(map(self._convert_traffic_sign_to_regulatory_element, self._odr_map.get_traffic_signs()))
         logging.info("Processing traffic lights")
         list(map(self._convert_traffic_light_to_regulatory_element, self._odr_map.get_traffic_lights()))
+        logging.info("Creating right of ways")
+        list(map(self._create_right_of_way, self._odr_map.get_junctions()))
 
         return self._lanelet2_map
 
@@ -679,23 +686,23 @@ class Odr2Lanelet2Conversor(object):
             )
         )
 
-    def _convert_stop_sign_to_regulatory_element(self, stop_sign):
+    def _convert_traffic_sign_to_regulatory_element(self, traffic_sign):
 
         # Linestring defining the stop sign
-        stop = self._lanelet2_map.add_linestring(lanelet2.Linestring(
+        sign = self._lanelet2_map.add_linestring(lanelet2.Linestring(
             uid=self._next_uid(),
             points=[
-                self._lanelet2_map.add_point(self._create_point(stop_sign["shape"][0])),
-                self._lanelet2_map.add_point(self._create_point(stop_sign["shape"][1]))
+                self._lanelet2_map.add_point(self._create_point(traffic_sign["shape"][0])),
+                self._lanelet2_map.add_point(self._create_point(traffic_sign["shape"][1]))
             ],
             attributes={
                 "type": "traffic_sign",
-                "subtype": "stop_sign"
+                "subtype": "stop_sign" if traffic_sign["type"] == "traffic.stop" else "yield_sign"
             }
         ))
 
         # For each landmark associated to this stop sign
-        for waypoint in stop_sign["landmarks"]:
+        for waypoint in traffic_sign["landmarks"]:
             segment = waypoint.road_id, waypoint.section_id, waypoint.lane_id
 
             # Linestring defining stop line.
@@ -716,7 +723,7 @@ class Odr2Lanelet2Conversor(object):
             regulatory_element = self._lanelet2_map.add_regulatory_element(lanelet2.RegulatoryElement(
                 uid=self._next_uid(),
                 parameters={
-                    "refers": [stop],
+                    "refers": [sign],
                     "ref_line": [stop_line]
                 },
                 attributes={
@@ -800,8 +807,180 @@ class Odr2Lanelet2Conversor(object):
 
             # Add the regulatory element to the affected road lanelet
             lanelet = self._lanelet2_map.get_lanelet(self._odr2lanelet[segment])
-            lanelet.add_regulatory_element(regulatory_element)            
-            #print(lanelet.regulatory_elements)
+            lanelet.add_regulatory_element(regulatory_element)
+
+    def _create_right_of_way(self, junction):
+        #https://autowarefoundation.github.io/autoware.universe/refs-tags-v1.0/planning/behavior_velocity_intersection_module/#how-towhy-set-rightofway-tag
+
+        def _compute_polygon(segments):
+
+            coords = []
+
+            def _get_points_uid(segment, border):
+                lanelet = self._lanelet2_map.get_lanelet(self._odr2lanelet[segment])
+                linestring = self._lanelet2_map.get_linestring(lanelet.left if border == "left" else lanelet.right)
+                return linestring.points
+
+            left_points, right_points = [], []
+
+            for segment in segments:
+                left_points += _get_points_uid(segment, "left")
+                right_points += _get_points_uid(segment, "right")
+
+            # remove shared points between segments
+            left_points = list(dict.fromkeys(left_points))
+            right_points = list(dict.fromkeys(right_points))
+
+            for point_uid in itertools.chain(left_points, right_points[::-1]):
+                point = self._lanelet2_map.get_point(point_uid)
+                coords.append(
+                    (float(point.get_attribute("local_x")), float(point.get_attribute("local_y")))
+                )
+
+            return shapely.geometry.Polygon(coords + [coords[0]])
+
+        def _compute_junction_topology(entrances):
+            # topology = {"entrance_wp": (segments, polygon), ...}
+            topology = {}
+
+            for entrance in entrances:
+
+                segment = entrance.road_id, entrance.section_id, entrance.lane_id
+
+                segments = [segment]
+
+                successors = self._odr_map.get_segment_successors(*segments[-1])
+                while len(successors) == 1 and successors[0][0] == segments[-1][0]:
+                    segments.append(successors[0])
+                    successors = self._odr_map.get_segment_successors(*segments[-1])
+
+                topology[entrance] = (segments, _compute_polygon(segments))
+
+            return topology
+
+        def _compute_conflicting(entrance, topology):
+            conflicting = []
+
+            #print("### Entrance: ", entrance.road_id, entrance.section_id, entrance.lane_id)
+
+            for other_entrance, (_, polygon) in topology.items():
+                if entrance == other_entrance:
+                    continue
+
+                # print("Check conflict with: ", other_entrance.road_id, other_entrance.section_id, other_entrance.lane_id)
+
+                # print("--- Polygon 1 ---")
+                # p1 = _compute_polygon([(entrance.road_id, entrance.section_id, entrance.lane_id)])
+                # print("is valid: ", p1.is_valid)
+                # plt.plot(*p1.exterior.xy)
+                # plt.show()
+
+                # print("--- Polygon 2 ---")
+                # p2 = _compute_polygon([(other_entrance.road_id, other_entrance.section_id, other_entrance.lane_id)])
+                # print("is valid: ", p2.is_valid)
+                # plt.plot(*p2.exterior.xy)
+                # plt.show()
+
+                area = topology[entrance][1].intersection(polygon).area
+                if area > 0.1:
+                    conflicting.append(other_entrance)
+
+            return conflicting
+
+        def _get_phase_entrances(entrance, topology):
+            inphase = []
+            anthiphase = []
+
+            for other_entrance, _ in topology.items():
+                if entrance == other_entrance:
+                    continue
+
+                entrance_vector = entrance.transform.rotation.get_forward_vector()
+                other_entrance_vector = other_entrance.transform.get_forward_vector()
+
+                dot  = entrance_vector.dot(other_entrance_vector)
+
+                if abs(dot) > math.cos(45):
+                    inphase.append(other_entrance)
+                else:
+                    anthiphase.append(other_entrance)
+
+            return inphase, anthiphase
+
+        def _is_regulated(entrance):
+            segment = (entrance.road_id, entrance.section_id, entrance.lane_id)
+            lanelet = self._lanelet2_map.get_lanelet(self._odr2lanelet[segment])
+
+            for regulatory_element in lanelet.regulatory_elements:
+                regulatory_element = self._lanelet2_map.get_regulatory_element(regulatory_element)
+                if regulatory_element.get_attribute("subtype") == "traffic_light":
+                    return "traffic_light"
+                
+                if regulatory_element.get_attribute("subtype") == "traffic_sign":
+                    return "traffic_sign"
+
+            return None
+
+        topology = _compute_junction_topology(junction)
+        right_of_way = collections.defaultdict(lambda: [])
+
+        for entrance in topology.keys():
+            entrance_segment = entrance.road_id, entrance.section_id, entrance.lane_id
+
+            conflicting = _compute_conflicting(entrance, topology)
+            inphase, anthiphase = _get_phase_entrances(entrance, topology)
+            is_regulated = _is_regulated(entrance)
+
+            if is_regulated == "traffic_light":
+                # No need to set yield_lane
+                continue
+
+            elif is_regulated == "traffic_sign":
+                for c in conflicting:
+                    if _is_regulated(c):
+                        # Follow autoware rules
+                        turn_direction = self._odr_map.get_turn_direction(*entrance_segment)
+                        if turn_direction == "right":
+                            if c in inphase:
+                                if self._odr_map.get_turn_direction(c.road_id, c.section_id, c.lane_id) == "left":
+                                    right_of_way[entrance].append(c)
+                    else:
+                        continue
+
+            if not is_regulated:
+                for c in conflicting:
+                    if not _is_regulated(c):
+                        # Follow autoware rules
+                        turn_direction = self._odr_map.get_turn_direction(*entrance_segment)
+                        if turn_direction == "right":
+                            if c in inphase:
+                                if self._odr_map.get_turn_direction(c.road_id, c.section_id, c.lane_id) == "left":
+                                    right_of_way[entrance].append(c)
+                    else:
+                        right_of_way[entrance].append(c)
+
+        # Create right of way regulatory elements
+        for entrance, yields_ in right_of_way.items():
+            all_row_segments = topology[entrance][0]
+            all_yield_segments = list(itertools.chain(topology[wp][0] for wp in yields_))[0]
+
+            regulatory_element = self._lanelet2_map.add_regulatory_element(lanelet2.RegulatoryElement(
+                uid=self._next_uid(),
+                parameters={
+                    "yield": [self._odr2lanelet[s] for s in all_yield_segments],
+                    "right_of_way": [self._odr2lanelet[s] for s in all_row_segments]
+                },
+                attributes={
+                    "type": "regulatory_element",
+                    "subtype": "right_of_way"
+                }
+            ))
+
+            # Add the regulatory element to the affected road lanelet
+            entrance_segment = entrance.road_id, entrance.section_id, entrance.lane_id
+            lanelet = self._lanelet2_map.get_lanelet(self._odr2lanelet[entrance_segment])
+            lanelet.add_regulatory_element(regulatory_element)
+
 
     def validate(self):
         for road_id in self._odr_map.get_roads():

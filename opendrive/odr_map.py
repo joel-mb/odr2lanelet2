@@ -1,4 +1,5 @@
 import collections
+import itertools
 import logging
 import math
 
@@ -150,6 +151,50 @@ class OdrMap(object):
 
         return left
 
+    def _get_first_waypoint(self, road_id, section_id, lane_id):
+        predecessors = self.get_segment_predecessors(road_id, section_id, lane_id)
+
+        # If there are more than one predecessor or predecessor road id is different from the target road id,
+        # this is the first section
+        if not predecessors or len(predecessors) > 1 or predecessors[0][0] != road_id:
+            return self.get_waypoint(road_id, section_id, lane_id)
+
+        return self._get_first_waypoint(*predecessors[0])
+
+    def _get_last_waypoint(self, road_id, section_id, lane_id):
+        successors = self.get_segment_successors(road_id, section_id, lane_id)
+
+        # If there are more than one successor or successor road id is different from the target road id,
+        # this is the latest section
+        if not successors or len(successors) > 1 or successors[0][0] != road_id:
+            return self.get_waypoint(*successors[0])
+
+        return self._get_last_waypoint(*successors[0])
+
+    def get_junctions(self):
+        topology = {}
+
+        junctions = set([wp.get_junction() for wp in self.get_waypoints()])
+        for junction in junctions:
+            if not junction or junction.id in topology:
+                continue
+
+            waypoints = junction.get_waypoints(carla.LaneType.Driving)
+
+            entrances = set()
+            for entrance, _ in waypoints:
+
+                road_id, section_id, lane_id = entrance.road_id, entrance.section_id, entrance.lane_id
+
+                first = self._get_first_waypoint(road_id, section_id, lane_id)
+                last = self._get_last_waypoint(road_id, section_id, lane_id)
+
+                entrances.add(first)
+
+            topology[junction.id] = entrances
+
+        return topology.values()
+
     def transform_to_geolocation(self, location):
         return self.carla_map.transform_to_geolocation(location)
 
@@ -163,28 +208,8 @@ class OdrMap(object):
     # FIXME: This only works for simple intersections (i.e., turns smaller than 180 degrees).
     def get_turn_direction(self, road_id, section_id, lane_id):
 
-        def _first_waypoint(road_id, section_id, lane_id):
-            predecessors = self.get_segment_predecessors(road_id, section_id, lane_id)
-
-            # If there are more than one predecessor or predecessor road id is different from the target road id,
-            # this is the first section
-            if len(predecessors) > 1 or predecessors[0][0] != road_id:
-                return self.get_waypoint(road_id, section_id, lane_id)
-
-            return _first_waypoint(*predecessors[0])
-
-        def _last_waypoint(road_id, section_id, lane_id):
-            successors = self.get_segment_successors(road_id, section_id, lane_id)
-
-            # If there are more than one successor or successor road id is different from the target road id,
-            # this is the latest section
-            if len(successors) > 1 or successors[0][0] != road_id:
-                return self.get_waypoint(*successors[0])
-
-            return _last_waypoint(*successors[0])
-
-        first_waypoint = _first_waypoint(road_id, section_id, lane_id)
-        last_waypoint = _last_waypoint(road_id, section_id, lane_id)
+        first_waypoint = self._get_first_waypoint(road_id, section_id, lane_id)
+        last_waypoint = self._get_last_waypoint(road_id, section_id, lane_id)
 
         first_vector = first_waypoint.transform.rotation.get_forward_vector()
         last_vector = last_waypoint.transform.rotation.get_forward_vector()
@@ -211,28 +236,33 @@ class OdrMap(object):
 
         return crosswalks
 
-    def get_stop_signs(self):
+    def get_traffic_signs(self):
 
         if not self.carla_world:
             return []
 
-        stop_signs = {}
+        traffic_signs = {}
 
-        for stop_sign in self.carla_world.get_actors().filter('traffic.stop'):
+        yields = self.carla_world.get_actors().filter("traffic.yield")
+        stops = self.carla_world.get_actors().filter("traffic.stop")
 
-            # FIXME: Add STOP sign shape?
-            p1 = stop_sign.get_transform().location
-            p2 = p1 + stop_sign.get_transform().rotation.get_up_vector() * 1.4
+        for traffic_sign in itertools.chain(yields, stops):
 
-            stop_signs[stop_sign.id] = {
+            # FIXME: Add traffic sign shape?
+            p1 = traffic_sign.get_transform().location
+            p2 = p1 + traffic_sign.get_transform().rotation.get_up_vector() * 1.4
+
+            traffic_signs[traffic_sign.id] = {
+                "type": traffic_sign.type_id,
                 "shape": [p1, p2],
                 "landmarks": []
             }
 
-        landmarks = self.carla_map.get_all_landmarks_of_type('206')
-        for landmark in landmarks:
-            stop_sign = self.carla_world.get_traffic_sign(landmark)
-            if not stop_sign:
+        yield_landmarks = self.carla_map.get_all_landmarks_of_type('205')
+        stop_landmarks = self.carla_map.get_all_landmarks_of_type('206')
+        for landmark in itertools.chain(yield_landmarks, stop_landmarks):
+            traffic_sign = self.carla_world.get_traffic_sign(landmark)
+            if not traffic_sign:
                 logging.warning("Landmark {} is not associated with any actor".format(landmark.id))
                 continue
 
@@ -248,9 +278,9 @@ class OdrMap(object):
                             format(landmark.id, landmark.road_id, lane_id, landmark.s))
                         continue
 
-                    stop_signs[stop_sign.id]["landmarks"].append(wp)
+                    traffic_signs[traffic_sign.id]["landmarks"].append(wp)
 
-        return stop_signs.values()
+        return traffic_signs.values()
 
     def get_traffic_lights(self):
 
@@ -262,6 +292,8 @@ class OdrMap(object):
         for traffic_light in self.carla_world.get_actors().filter('traffic.traffic_light'):
 
             component_names = list(filter(lambda c: c.startswith("box"), traffic_light.get_component_names()))
+            if not component_names:
+                continue
             # Each traffic light box has 7 components defining:
             #    * top_left, top_right, bottom_left, bottom_right
             #    * green light bulb, yellow light bulb, red light bulb
